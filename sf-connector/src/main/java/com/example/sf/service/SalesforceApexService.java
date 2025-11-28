@@ -123,6 +123,9 @@ public class SalesforceApexService {
                             Path oldSubDir = oldDir.resolve(relativePath);
                             if (!Files.exists(oldSubDir)) Files.createDirectories(oldSubDir);
                             
+                            // Delete all previous archived versions of this file
+                            deleteOldArchivedVersions(oldSubDir, baseName, extension);
+                            
                             Path archivedFile = oldSubDir.resolve(archivedFileName);
                             Files.copy(targetFile, archivedFile, StandardCopyOption.REPLACE_EXISTING);
                             archivedCount++;
@@ -213,13 +216,18 @@ public class SalesforceApexService {
               LOG.info("zipFile base64 length={}", zipBase64.length());
               byte[] zipBytes = Base64.getDecoder().decode(zipBase64);
 
-              // Extract ZIP structure to storage/apex/new/ preserving folder hierarchy
+              // Extract ZIP structure to storage/apex/new/ with content-based archival
               // This includes unpackaged/classes/*.cls and *.cls-meta.xml files
               Path newDir = Path.of("storage", "apex", "new");
+              Path oldDir = Path.of("storage", "apex", "old");
               if (!Files.exists(newDir)) Files.createDirectories(newDir);
+              if (!Files.exists(oldDir)) Files.createDirectories(oldDir);
               
+              String timestamp = String.valueOf(System.currentTimeMillis());
               boolean hasCls = false;
               int extractedCount = 0;
+              int archivedCount = 0;
+              
               try (ZipInputStream zin2 = new ZipInputStream(new ByteArrayInputStream(zipBytes))) {
                 ZipEntry entry;
                 while ((entry = zin2.getNextEntry()) != null) {
@@ -231,7 +239,7 @@ public class SalesforceApexService {
                     continue;
                   }
                   
-                  // Save all files preserving folder structure
+                  // Save all files preserving folder structure with archival logic
                   Path targetFile = newDir.resolve(entryName);
                   Path parentDir = targetFile.getParent();
                   if (parentDir != null && !Files.exists(parentDir)) {
@@ -241,6 +249,39 @@ public class SalesforceApexService {
                   ByteArrayOutputStream out = new ByteArrayOutputStream();
                   zin2.transferTo(out);
                   byte[] fileBytes = out.toByteArray();
+                  String newContent = new String(fileBytes, java.nio.charset.StandardCharsets.UTF_8);
+                  
+                  // Content-based archival: compare with existing file
+                  if (Files.exists(targetFile)) {
+                    String existingContent = Files.readString(targetFile, java.nio.charset.StandardCharsets.UTF_8);
+                    
+                    // If content differs, archive old file with timestamp
+                    if (!existingContent.equals(newContent)) {
+                      String fileName = targetFile.getFileName().toString();
+                      String baseName = fileName.contains(".") 
+                          ? fileName.substring(0, fileName.lastIndexOf('.'))
+                          : fileName;
+                      String extension = fileName.contains(".")
+                          ? fileName.substring(fileName.lastIndexOf('.'))
+                          : "";
+                      String archivedFileName = baseName + "_" + timestamp + extension;
+                      
+                      // Preserve folder structure in old/
+                      Path relativePath = newDir.relativize(targetFile.getParent());
+                      Path oldSubDir = oldDir.resolve(relativePath);
+                      if (!Files.exists(oldSubDir)) Files.createDirectories(oldSubDir);
+                      
+                      // Delete all previous archived versions of this file
+                      deleteOldArchivedVersions(oldSubDir, baseName, extension);
+                      
+                      Path archivedFile = oldSubDir.resolve(archivedFileName);
+                      Files.copy(targetFile, archivedFile, StandardCopyOption.REPLACE_EXISTING);
+                      archivedCount++;
+                      LOG.info("📦 Archived changed file: {} → {}", entryName, archivedFile.getFileName());
+                    }
+                  }
+                  
+                  // Write new content
                   Files.write(targetFile, fileBytes, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
                   extractedCount++;
                   
@@ -257,6 +298,9 @@ public class SalesforceApexService {
               }
               
               LOG.info("✅ Extracted {} files to {}", extractedCount, newDir.toAbsolutePath());
+              if (archivedCount > 0) {
+                LOG.info("📦 Archived {} changed files to {} with timestamp {}", archivedCount, oldDir.toAbsolutePath(), timestamp);
+              }
 
               if (!hasCls) {
                 String msg = "Metadata retrieve returned no Apex class files. " +
@@ -295,6 +339,34 @@ public class SalesforceApexService {
         int e = xml.indexOf("</" + tag + ">", s);
         if (e < 0) return null;
         return xml.substring(s + tag.length() + 2, e);
+    }
+
+    /**
+     * Delete all previous archived versions of a file before saving the new one.
+     * Pattern: ClassName_*.cls
+     */
+    private void deleteOldArchivedVersions(Path directory, String baseName, String extension) {
+        try {
+            if (!Files.exists(directory)) return;
+            
+            String pattern = baseName + "_";
+            try (java.util.stream.Stream<Path> paths = Files.list(directory)) {
+                paths.filter(p -> {
+                    String name = p.getFileName().toString();
+                    return name.startsWith(pattern) && name.endsWith(extension);
+                })
+                .forEach(p -> {
+                    try {
+                        Files.delete(p);
+                        LOG.info("🗑️  Deleted old archived version: {}", p.getFileName());
+                    } catch (Exception e) {
+                        LOG.warn("Failed to delete old archived file {}: {}", p.getFileName(), e.getMessage());
+                    }
+                });
+            }
+        } catch (Exception e) {
+            LOG.error("Error deleting old archived versions: {}", e.getMessage());
+        }
     }
 
     public List<Map<String, Object>> getApexClassList(String token, String instanceUrl) throws Exception {
