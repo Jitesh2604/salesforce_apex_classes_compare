@@ -4,3 +4,6 @@ sf-connector/target/**
 sf-connector/target/
 sf-connector/target/
 target/
+
+# Environment variables with secrets
+.env
